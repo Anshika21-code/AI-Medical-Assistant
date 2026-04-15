@@ -3,16 +3,17 @@ import { getPubMedResults } from '../services/pubmed.js';
 import { getOpenAlexResults } from '../services/openAlex.js';
 import { getClinicalTrials } from '../services/clinicalTrials.js';
 import { rankPublications, rankClinicalTrials } from '../services/ranker.js';
+import { generateResearchResponse } from '../services/llm.js';
 
 export async function searchResearch(req, res) {
   try {
-    const { query, disease = '', location = '' } = req.query;
+    const { query, disease = '', location = '', sessionId = null } = req.query;
     if (!query) return res.status(400).json({ error: 'query is required' });
 
-    const { expanded, base } = expandQuery(query, disease, location);
-    console.log(` Expanded query: "${expanded}"`);
+    const { expanded } = expandQuery(query, disease, location);
+    console.log(`🔍 Expanded query: "${expanded}"`);
 
-    // Fetch all 3 sources in parallel
+    // Step 1 — Fetch all sources in parallel
     const [pubmedRaw, openAlexRaw, trialsRaw] = await Promise.all([
       getPubMedResults(expanded, 80),
       getOpenAlexResults(expanded, 100),
@@ -21,21 +22,32 @@ export async function searchResearch(req, res) {
 
     console.log(` Raw pool — PubMed: ${pubmedRaw.length}, OpenAlex: ${openAlexRaw.length}, Trials: ${trialsRaw.length}`);
 
-    // Merge publications + rank
+    // Step 2 — Rank and filter
     const allPublications = [...pubmedRaw, ...openAlexRaw];
     const topPublications = rankPublications(allPublications, query, disease, 8)
-  .map(({ _score, ...pub }) => ({   // _score frontend ko nahi chahiye
-    ...pub,
-    abstract: pub.abstract?.slice(0, 300) // 800 → 300 chars
-  }));
+      .map(({ _score, ...pub }) => ({
+        ...pub,
+        abstract: pub.abstract?.slice(0, 400),
+      }));
+
     const topTrials = rankClinicalTrials(trialsRaw, disease || query, 6)
-  .map(({ _score, ...trial }) => ({
-    ...trial,
-    eligibilityCriteria: trial.eligibilityCriteria?.slice(0, 200)
-  }));
+      .map(({ _score, ...trial }) => ({
+        ...trial,
+        eligibilityCriteria: trial.eligibilityCriteria?.slice(0, 300),
+      }));
 
-    console.log(` Final — Publications: ${topPublications.length}, Trials: ${topTrials.length}`);
+    console.log(` Ranked — Publications: ${topPublications.length}, Trials: ${topTrials.length}`);
 
+    // Step 3 — LLM reasoning
+    const llmResult = await generateResearchResponse({
+      query,
+      disease,
+      publications: topPublications,
+      clinicalTrials: topTrials,
+      conversationHistory: [], // Phase 4 mein fill hoga
+    });
+
+    // Step 4 — Send structured response
     res.json({
       query: expanded,
       disease,
@@ -43,6 +55,9 @@ export async function searchResearch(req, res) {
       totalPool: allPublications.length,
       publications: topPublications,
       clinicalTrials: topTrials,
+      aiResponse: llmResult.response,
+      model: llmResult.model,
+      success: llmResult.success,
     });
 
   } catch (err) {
